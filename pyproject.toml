@@ -1,0 +1,22 @@
+[project]
+name = "tsp-sa"
+version = "0.1.0"
+description = "Projekt realizuje problem komiwojazera (TSP) w rozszerzonej wersji z oknami czasowymi, rozwiazywany za pomoca algorytmu symulowanego wyzazania z lokalnym przeszukiwaniem 2-opt."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+	"matplotlib>=3.8",
+	"numpy>=1.26",
+]
+
+[project.scripts]
+main = "main:main"
+tsp-sa = "main:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
+
