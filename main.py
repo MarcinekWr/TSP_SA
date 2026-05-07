@@ -27,8 +27,9 @@ class TSPTWInstance:
     coords: list[tuple]
 
 
-NUM_CITIES = 7
+NUM_CITIES = 20
 BRUTE_FORCE_CITY_LIMIT = 10
+TIME_WINDOW = 999_999
 
 
 def positive_int(value: str) -> int:
@@ -66,8 +67,8 @@ def parse_args():
     parser.add_argument(
         "--iterations",
         type=positive_int,
-        default=5000,
-        help="Number of SA iterations (default: 5000)",
+        default=10000,
+        help="Number of SA iterations (default: 10000)",
     )
     parser.add_argument(
         "--initial-temp",
@@ -86,6 +87,13 @@ def parse_args():
         type=int,
         default=None,
         help="Optional random seed for reproducible runs",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="insert_node",
+        choices=["two_opt_swap", "swap_nodes", "insert_node"],
+        help="Neighborhood move function used by SA (default: insert_node)",
     )
     return parser.parse_args()
 
@@ -137,12 +145,12 @@ def eval_instance(instance: TSPTWInstance, route: list[tuple]) -> tuple[float, b
 
         arrival_time = current_time + instance.dist[current_location][next_location]
         e_next, l_next = instance.time_windows[next_location]
-        
+
         if arrival_time < e_next:
-            current_time = e_next  
+            current_time = e_next
         elif arrival_time > l_next:
             flag = False
-            current_time = arrival_time  
+            current_time = arrival_time
         else:
             current_time = arrival_time
 
@@ -193,7 +201,7 @@ def generate_instance():
     cities_coords = np.array(cities_coords)
     dists = np.linalg.norm(cities_coords[:, None] - cities_coords[None, :], axis=2)
 
-    time_windows = [(0, 200)]
+    time_windows = [(0, TIME_WINDOW)]
     for i in range(NUM_CITIES):
         earliest = int(dists[0][i])
 
@@ -240,11 +248,6 @@ def evaluate_feasibility(tswp_init, routes, feasibles):
         calc_dist, feasible = eval_instance(tswp_init, route)
         feasibles.append((int(feasible), calc_dist))
 
-    # for (f, d), route in zip(feasibles, routes):
-    #     if f:
-    #         # print("!!!!Feasible ", end="")
-    #         # print(f"Distance: {d} for route {route}")
-
 
 def create_route_permutation():
     route = permutations(list(range(1, NUM_CITIES)))
@@ -282,15 +285,52 @@ def plot_routes(instance: TSPTWInstance, routes, feasibles):
     plt.legend(fontsize=7)
 
 
-#SA -----------Algorithm----------------------------------------------------------------
+# SA ----------- Funkcje sąsiedztwa (generatory ruchu) ----------------------
+
 def two_opt_swap(route: list, i: int, j: int) -> list:
     """
-    Return a new route with the segment between indices i and j reversed.
+    Odwrócenie podciągu trasy między indeksami i oraz j (losowy ruch 2-opt).
     route = [0, 1, 2, 3, 4, 0]
     i=1, j=3 → [0, 3, 2, 1, 4, 0]
     """
-    new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
+    new_route = route[:i] + route[i:j + 1][::-1] + route[j + 1:]
     return new_route
+
+
+def swap_nodes(route: list, n: int) -> list:
+    """
+    Zamiana miejscami dwóch losowo wybranych miast (bez depotu).
+    Nie zmienia kolejności pozostałych wierzchołków.
+    """
+    i, j = np.random.choice(range(1, n), size=2, replace=False)
+    new_route = route[:]
+    new_route[i], new_route[j] = new_route[j], new_route[i]
+    return new_route
+
+
+def insert_node(route: list, n: int) -> list:
+    """
+    Wyjęcie jednego miasta z pozycji i i wklejenie go na losową pozycję j.
+    Zmiana chirurgiczna – modyfikuje kontekst jednego wierzchołka,
+    nie naruszając względnej kolejności pozostałych.
+    """
+    i = np.random.randint(1, n)
+    city = route[i]
+    new_route = route[:i] + route[i + 1:]   # wyciągnij miasto
+    j = np.random.randint(1, n)              # nowa pozycja (w skróconej liście)
+    new_route.insert(j, city)
+    return new_route
+
+
+# Rejestr dostępnych metod – łatwo rozszerzalny
+NEIGHBORHOOD_FUNCTIONS = {
+    "two_opt_swap": None,       # obsługa osobna – wymaga i, j
+    "swap_nodes":   swap_nodes,
+    "insert_node":  insert_node,
+}
+
+
+# SA ----------- Akceptacja --------------------------------------------------
 
 def calculate_time_window_violation(instance: TSPTWInstance, route: list[tuple]) -> float:
     """
@@ -305,11 +345,11 @@ def calculate_time_window_violation(instance: TSPTWInstance, route: list[tuple])
 
         arrival_time = current_time + instance.dist[current_location][next_location]
         e_next, l_next = instance.time_windows[next_location]
-        
+
         if arrival_time > l_next:
             violation = arrival_time - l_next
             total_violation += violation
-        
+
         if arrival_time < e_next:
             current_time = e_next
         else:
@@ -317,90 +357,106 @@ def calculate_time_window_violation(instance: TSPTWInstance, route: list[tuple])
 
     return total_violation
 
-def should_accept_improved(current_route, new_route, instance, 
+
+def should_accept_improved(current_route, new_route, instance,
                            current_cost, current_feasible,
                            new_cost, new_feasible, temperature):
     """
     Decide whether to accept a candidate move using feasibility-aware SA logic.
     """
-    
     if not current_feasible and new_feasible:
         return True
-    
+
     if current_feasible and not new_feasible:
         return False
-    
+
     if current_feasible and new_feasible:
         delta_cost = new_cost - current_cost
         if delta_cost < 0:
             return True
         probability = np.exp(-delta_cost / temperature)
         return np.random.random() < probability
-    
+
     if not current_feasible and not new_feasible:
         current_violation = calculate_time_window_violation(instance, current_route)
         new_violation = calculate_time_window_violation(instance, new_route)
-        
+
         if new_violation < current_violation:
             return True
-        
+
         delta_violation = new_violation - current_violation
         probability = np.exp(-delta_violation / temperature)
         return np.random.random() < probability
 
+
+# SA ----------- Główny algorytm ---------------------------------------------
+
 @timed
-def simulated_annealing(instance: TSPTWInstance, initial_route, 
-                              num_iterations=10000, initial_temp=100.0, 
-                              cooling_rate=0.995, verbose=False,
-                              progress_interval=1000):
+def simulated_annealing(instance: TSPTWInstance, initial_route,
+                        num_iterations=10000, initial_temp=100.0,
+                        cooling_rate=0.995, verbose=False,
+                        progress_interval=1000,
+                        method: str = "insert_node"):
     """
     Run simulated annealing with feasibility-aware acceptance.
 
-    Key improvements:
-    1. eval_instance advances the timeline consistently at each step.
-    2. Among infeasible routes, comparison is based on total time-window
-       violation instead of travel distance.
+    Parametr ``method`` wybiera funkcję sąsiedztwa:
+      - 'two_opt_swap' : losowe odwrócenie podciągu trasy (domyślny w literaturze)
+      - 'swap_nodes'   : zamiana miejscami dwóch losowych miast
+      - 'insert_node'  : przeniesienie jednego miasta w nowe miejsce trasy
+                         (najlepsza skuteczność przy restrykcyjnych oknach czasowych)
     """
     current_route = list(initial_route)
     current_cost, current_feasible = eval_instance(instance, current_route)
-    
+
     best_route = current_route
     best_cost = current_cost
     best_feasible = current_feasible
-    
+
     temperature = initial_temp
     costs_history = []
     feasible_history = []
     violation_history = []
-    
+
+    # Wybierz funkcję generującą nową trasę
+    if method == "two_opt_swap":
+        def generate_neighbour(route):
+            i = np.random.randint(1, instance.n - 1)
+            j = np.random.randint(i + 1, instance.n)
+            return two_opt_swap(route, i, j)
+    elif method == "swap_nodes":
+        def generate_neighbour(route):
+            return swap_nodes(route, instance.n)
+    else:  # insert_node (domyślny)
+        def generate_neighbour(route):
+            return insert_node(route, instance.n)
+
     for iteration in range(num_iterations):
-        i = np.random.randint(1, instance.n - 1)
-        j = np.random.randint(i + 1, instance.n)
-        new_route = two_opt_swap(current_route, i, j)
-        
+        new_route = generate_neighbour(current_route)
+
         new_cost, new_feasible = eval_instance(instance, new_route)
-        
+
         should_accept = should_accept_improved(
             current_route, new_route, instance,
             current_cost, current_feasible,
             new_cost, new_feasible, temperature
         )
-        
+
         if should_accept:
             current_route = new_route
             current_cost = new_cost
             current_feasible = new_feasible
-            
+
             if new_feasible and (not best_feasible or new_cost < best_cost):
                 best_route = new_route
                 best_cost = new_cost
                 best_feasible = new_feasible
-            
+
             elif not best_feasible and new_cost < best_cost:
                 best_route = new_route
                 best_cost = new_cost
                 best_feasible = new_feasible
-        
+
         temperature *= cooling_rate
         costs_history.append(current_cost)
         feasible_history.append(int(current_feasible))
@@ -408,7 +464,7 @@ def simulated_annealing(instance: TSPTWInstance, initial_route,
             violation_history.append(calculate_time_window_violation(instance, current_route))
         else:
             violation_history.append(0)
-        
+
         if temperature < 1e-8:
             break
 
@@ -417,7 +473,7 @@ def simulated_annealing(instance: TSPTWInstance, initial_route,
                 f"SA progress: iteration {iteration + 1}/{num_iterations}, "
                 f"current_cost={current_cost:.2f}, feasible={current_feasible}"
             )
-    
+
     return best_route, best_cost, best_feasible, costs_history, feasible_history, violation_history
 
 
@@ -440,7 +496,7 @@ def main():
         f"Estimated brute force time: {format_duration(estimated_bf_seconds)} "
         f"(avg route eval: {avg_route_seconds * 1e6:.2f} us)"
     )
-    
+
     best_brute = None
     if args.num_city <= BRUTE_FORCE_CITY_LIMIT:
         best_brute, routes, feasibles = run_brute_force(tswp_init)
@@ -450,41 +506,44 @@ def main():
             f"Skipping brute force for {args.num_city} cities "
             f"(limit: {BRUTE_FORCE_CITY_LIMIT}) to avoid excessive memory/time.\n"
         )
-    
-    routes_nn = nearest_neighbour(tswp_init)  
+
+    routes_nn = nearest_neighbour(tswp_init)
     nn_cost, nn_feas = eval_instance(tswp_init, routes_nn[0])
     print(f"NN: Cost={nn_cost:.2f}, Feasible={nn_feas}")
-    
+
     print("\nRunning SA...")
     print(
         f"Params: num_city={args.num_city}, iterations={args.iterations}, "
-        f"initial_temp={args.initial_temp}, cooling_rate={args.cooling_rate}"
+        f"initial_temp={args.initial_temp}, cooling_rate={args.cooling_rate}, "
+        f"method={args.method}"
     )
 
     best_route, best_cost, best_feas, history, feas_hist, viol_hist = simulated_annealing(
-        tswp_init, 
+        tswp_init,
         routes_nn[0],
         num_iterations=args.iterations,
         initial_temp=args.initial_temp,
-        cooling_rate=args.cooling_rate
+        cooling_rate=args.cooling_rate,
+        method=args.method,         
     )
-    
+
     print(f"\nSA Best: Costs={best_cost:.2f}, Feasible={best_feas}")
-    
+
     print(f"\n{'='*60}")
     if best_brute is not None:
         print(f"Brute Force: {best_brute[1]:>8.2f}  (Feasible)")
     else:
         print("Brute Force:    skipped")
     print(f"NN:          {nn_cost:>8.2f}  (Feasible={nn_feas})")
-    print(f"SA:          {best_cost:>8.2f}  (Feasible={best_feas})")
+    print(f"SA:          {best_cost:>8.2f}  (Feasible={best_feas}, method={args.method})")
     print(f"{'='*60}")
-    
+
     feasible_iter = next((i for i, f in enumerate(feas_hist) if f), None)
     if feasible_iter is not None:
         print(f"Feasible solution found at iteration: {feasible_iter + 1}")
     else:
         print(f"No feasible solution found")
+
 
 if __name__ == "__main__":
     main()
