@@ -95,6 +95,18 @@ def parse_args():
         choices=["two_opt_swap", "swap_nodes", "insert_node"],
         help="Neighborhood move function used by SA (default: insert_node)",
     )
+    parser.add_argument(
+        "--acceptance-mode",
+        "--acceptance_mode",
+        type=str,
+        default="violation",
+        choices=["violation", "distance"],
+        help=(
+            "Acceptance criterion when both routes are infeasible: "
+            "'violation' minimizes sum of time-window violations (default), "
+            "'distance' minimizes total route distance (standard SA)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -228,17 +240,20 @@ def generate_feasible_instance():
     known_route = [0] + inner + [0]
 
     time_windows = [None] * NUM_CITIES
-    time_windows[0] = (0, 200)
     current_time = 0
     for i in range(len(known_route) - 1):
         src, dst = known_route[i], known_route[i + 1]
+        current_time += dists[src][dst]
         if dst == 0:
             break
-        current_time += dists[src][dst]
         window_width = np.random.randint(20, 40)
         e = int(current_time)
         l = e + window_width
         time_windows[dst] = (e, l)
+
+    # Okno depotu obejmuje cały czas trasy known_route z marginesem
+    depot_return_time = int(current_time)
+    time_windows[0] = (0, depot_return_time + 50)
 
     return TSPTWInstance(n=NUM_CITIES, dist=dists, time_windows=time_windows, coords=cities_coords), known_route
 
@@ -289,9 +304,17 @@ def plot_routes(instance: TSPTWInstance, routes, feasibles):
 
 def two_opt_swap(route: list, i: int, j: int) -> list:
     """
-    Odwrócenie podciągu trasy między indeksami i oraz j (losowy ruch 2-opt).
-    route = [0, 1, 2, 3, 4, 0]
-    i=1, j=3 → [0, 3, 2, 1, 4, 0]
+    usuwa dwie krawędzie (route[i-1]→route[i])
+    i (route[j]→route[j+1]), a następnie łączy segmenty w nowej kolejności,
+    odwracając podciąg między i a j.
+
+    Dla trasy [0, A, B, C, D, E, 0] z i=2, j=4:
+      Usuwane krawędzie: A→B  oraz  D→E
+      Nowa trasa:        [0, A, D, C, B, E, 0]
+
+    Krawędź (route[i-1] → route[i]) jest zastępowana przez (route[i-1] → route[j]),
+    a krawędź (route[j] → route[j+1]) przez (route[i] → route[j+1]).
+    Segment route[i..j] zostaje odwrócony, co realizuje właśnie to przepięcie.
     """
     new_route = route[:i] + route[i:j + 1][::-1] + route[j + 1:]
     return new_route
@@ -360,9 +383,15 @@ def calculate_time_window_violation(instance: TSPTWInstance, route: list[tuple])
 
 def should_accept_improved(current_route, new_route, instance,
                            current_cost, current_feasible,
-                           new_cost, new_feasible, temperature):
+                           new_cost, new_feasible, temperature,
+                           acceptance_mode: str = "violation"):
     """
     Decide whether to accept a candidate move using feasibility-aware SA logic.
+
+    Parametr ``acceptance_mode`` wybiera strategię akceptacji gdy obie trasy
+    są niefeasible:
+      - 'violation' : porównuj sumy przekroczeń okien czasowych (domyślne)
+      - 'distance'  : porównuj łączną odległość trasy (standardowe SA)
     """
     if not current_feasible and new_feasible:
         return True
@@ -378,15 +407,24 @@ def should_accept_improved(current_route, new_route, instance,
         return np.random.random() < probability
 
     if not current_feasible and not new_feasible:
-        current_violation = calculate_time_window_violation(instance, current_route)
-        new_violation = calculate_time_window_violation(instance, new_route)
+        if acceptance_mode == "distance":
+            # Wariant B: porównuj łączną odległość (standardowe kryterium SA)
+            delta_cost = new_cost - current_cost
+            if delta_cost < 0:
+                return True
+            probability = np.exp(-delta_cost / temperature)
+            return np.random.random() < probability
+        else:
+            # Wariant A (domyślny): porównuj sumę przekroczeń okien czasowych
+            current_violation = calculate_time_window_violation(instance, current_route)
+            new_violation = calculate_time_window_violation(instance, new_route)
 
-        if new_violation < current_violation:
-            return True
+            if new_violation < current_violation:
+                return True
 
-        delta_violation = new_violation - current_violation
-        probability = np.exp(-delta_violation / temperature)
-        return np.random.random() < probability
+            delta_violation = new_violation - current_violation
+            probability = np.exp(-delta_violation / temperature)
+            return np.random.random() < probability
 
 
 # SA ----------- Główny algorytm ---------------------------------------------
@@ -396,15 +434,22 @@ def simulated_annealing(instance: TSPTWInstance, initial_route,
                         num_iterations=10000, initial_temp=100.0,
                         cooling_rate=0.995, verbose=False,
                         progress_interval=1000,
-                        method: str = "insert_node"):
+                        method: str = "insert_node",
+                        acceptance_mode: str = "violation"):
     """
     Run simulated annealing with feasibility-aware acceptance.
 
     Parametr ``method`` wybiera funkcję sąsiedztwa:
-      - 'two_opt_swap' : losowe odwrócenie podciągu trasy (domyślny w literaturze)
+      - 'two_opt_swap' : prawdziwy ruch 2-opt – usuwa dwie krawędzie i przepina
+                         segmenty; odwraca podciąg między indeksami i oraz j
       - 'swap_nodes'   : zamiana miejscami dwóch losowych miast
       - 'insert_node'  : przeniesienie jednego miasta w nowe miejsce trasy
                          (najlepsza skuteczność przy restrykcyjnych oknach czasowych)
+
+    Parametr ``acceptance_mode`` wybiera strategię akceptacji gdy obie trasy są
+    niefeasible:
+      - 'violation' : minimalizuj sumę przekroczeń okien czasowych (domyślne)
+      - 'distance'  : minimalizuj łączną odległość trasy (standardowe SA)
     """
     current_route = list(initial_route)
     current_cost, current_feasible = eval_instance(instance, current_route)
@@ -439,7 +484,8 @@ def simulated_annealing(instance: TSPTWInstance, initial_route,
         should_accept = should_accept_improved(
             current_route, new_route, instance,
             current_cost, current_feasible,
-            new_cost, new_feasible, temperature
+            new_cost, new_feasible, temperature,
+            acceptance_mode=acceptance_mode
         )
 
         if should_accept:
@@ -515,7 +561,7 @@ def main():
     print(
         f"Params: num_city={args.num_city}, iterations={args.iterations}, "
         f"initial_temp={args.initial_temp}, cooling_rate={args.cooling_rate}, "
-        f"method={args.method}"
+        f"method={args.method}, acceptance_mode={args.acceptance_mode}"
     )
 
     best_route, best_cost, best_feas, history, feas_hist, viol_hist = simulated_annealing(
@@ -524,7 +570,8 @@ def main():
         num_iterations=args.iterations,
         initial_temp=args.initial_temp,
         cooling_rate=args.cooling_rate,
-        method=args.method,         
+        method=args.method,
+        acceptance_mode=args.acceptance_mode,
     )
 
     print(f"\nSA Best: Costs={best_cost:.2f}, Feasible={best_feas}")
@@ -535,7 +582,7 @@ def main():
     else:
         print("Brute Force:    skipped")
     print(f"NN:          {nn_cost:>8.2f}  (Feasible={nn_feas})")
-    print(f"SA:          {best_cost:>8.2f}  (Feasible={best_feas}, method={args.method})")
+    print(f"SA:          {best_cost:>8.2f}  (Feasible={best_feas}, method={args.method}, acceptance={args.acceptance_mode})")
     print(f"{'='*60}")
 
     feasible_iter = next((i for i, f in enumerate(feas_hist) if f), None)
